@@ -34,7 +34,7 @@ class ScriptArguments:
     weight_decay: Optional[float] = field(default=0.05, metadata={"help": "the weight decay"})
     optimizer_type: Optional[str] = field(default="paged_adamw_32bit", metadata={"help": "the optimizer type"})
 
-    per_device_train_batch_size: Optional[int] = field(default=16, metadata={"help": "train batch size per device"})
+    per_device_train_batch_size: Optional[int] = field(default=4, metadata={"help": "train batch size per device"})
     per_device_eval_batch_size: Optional[int] = field(default=4, metadata={"help": "eval batch size per device"})
     gradient_accumulation_steps: Optional[int] = field(
         default=4, metadata={"help": "the number of gradient accumulation steps"}
@@ -82,7 +82,7 @@ if __name__ == "__main__":
     script_args = parser.parse_args_into_dataclasses()[0]
 
     # 1. load a pretrained model
-    model = AutoModelForCausalLM.from_pretrained("insub/gpt2-large-imdb-fine-tuned")
+    model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
     tokenizer = AutoTokenizer.from_pretrained("gpt2-large")
     tokenizer.pad_token = tokenizer.eos_token
 
