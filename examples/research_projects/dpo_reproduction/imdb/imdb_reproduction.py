@@ -120,7 +120,7 @@ if __name__ == "__main__":
         lr_scheduler_type=script_args.lr_scheduler_type,
         warmup_steps=script_args.warmup_steps,
         optim=script_args.optimizer_type,
-        bf16=True,
+        bf16=False,
         remove_unused_columns=False,
         run_name="dpo_llama2",
     )
