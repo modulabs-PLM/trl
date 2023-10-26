@@ -136,6 +136,7 @@ class PPOTrainer_wrapper(DPOTrainer):
 
         # https://nlp.stanford.edu/IR-book/html/htmledition/extended-language-modeling-approaches-1.html
         # https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
+        # .
         # KL-div는 확률값끼리 비교하기 때문에 찢어놨던 logps를 다시 폴리시, ref 각각 합쳐줌
         policy_logps = torch.cat((policy_chosen_logps, policy_rejected_logps), dim=0) # add
         reference_logps = torch.cat((reference_chosen_logps, reference_rejected_logps), dim=0) # add
