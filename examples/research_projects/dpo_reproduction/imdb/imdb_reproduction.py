@@ -1,16 +1,163 @@
 # 0. imports
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Union, Literal, Callable, List, Tuple
 
 import torch
+import torch.nn as nn
 from datasets import Dataset, load_dataset
 from peft import AutoPeftModelForCausalLM, LoraConfig, get_peft_model
 
 from transformers import AutoTokenizer, HfArgumentParser, TrainingArguments, AutoModelForCausalLM
-
+from transformers import PreTrainedModel, DataCollator, PreTrainedTokenizerBase, TrainerCallback # add
+from transformers.trainer_callback import TrainerCallback # add
+from transformers.trainer_utils import EvalLoopOutput # add
+from transformers import pipeline # add
 from trl import DPOTrainer
 from tqdm import tqdm
+
+
+class PPOTrainer_wrapper(DPOTrainer):
+    """
+     - for reproduct fig2 in DPO
+     - we need KL-div and reward for vaildation step
+     - so override some functions() and logging.
+    """
+    def __init__(
+        self,
+        model: Union[PreTrainedModel, nn.Module] = None,
+        ref_model: Optional[Union[PreTrainedModel, nn.Module]] = None,
+        reward_model_name : str  = "siebert/sentiment-roberta-large-english",
+        return_KL_div : bool = True,
+        beta: float = 0.1,
+        loss_type: Literal["sigmoid", "hinge"] = "sigmoid",
+        args: TrainingArguments = None,
+        data_collator: Optional[DataCollator] = None,
+        label_pad_token_id: int = -100,
+        padding_value: int = 0,
+        truncation_mode: str = "keep_end",
+        train_dataset: Optional[Dataset] = None,
+        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
+        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        model_init: Optional[Callable[[], PreTrainedModel]] = None,
+        callbacks: Optional[List[TrainerCallback]] = None,
+        optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (
+            None,
+            None,
+        ),
+        preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+        max_length: Optional[int] = None,
+        max_prompt_length: Optional[int] = None,
+        max_target_length: Optional[int] = None,
+        peft_config: Optional[Dict] = None,
+        is_encoder_decoder: Optional[bool] = None,
+        disable_dropout: bool = True,
+        generate_during_eval: bool = False,
+        compute_metrics: Optional[Callable[[EvalLoopOutput], Dict]] = None,
+    ):
+        """
+        Added Args:
+            reward_model (`transformers.PreTrainedModel`):
+                The model to logging sentimental reward in evaluation step, preferably an `AutoModelForSequenceClassification`.
+            return_KL_div (`bool`, defaults to True):
+                return KL divergence and log them
+        """
+        super().__init__(
+            model = model,
+            ref_model = ref_model,
+            beta = beta,
+            # loss_type = loss_type, # ?? why ????
+            args = args,
+            data_collator = data_collator,
+            label_pad_token_id = label_pad_token_id,
+            padding_value = padding_value,
+            truncation_mode = truncation_mode,
+            train_dataset = train_dataset,
+            eval_dataset = eval_dataset,
+            tokenizer = tokenizer,
+            model_init = model_init,
+            callbacks = callbacks,
+            optimizers = optimizers,
+            preprocess_logits_for_metrics = preprocess_logits_for_metrics,
+            max_length = max_length,
+            max_prompt_length = max_prompt_length,
+            max_target_length = max_target_length,
+            peft_config = peft_config,
+            is_encoder_decoder = is_encoder_decoder,
+            disable_dropout = disable_dropout,
+            generate_during_eval = generate_during_eval,
+            compute_metrics = compute_metrics,
+        )
+        
+        if reward_model_name is None:
+            self.reward_pipe = pipeline("text-classification", model=reward_model_name)
+        self.return_KL_div = return_KL_div
+
+
+    def get_batch_metrics(
+        self,
+        model,
+        batch: Dict[str, Union[List, torch.LongTensor]],
+        train_eval: Literal["train", "eval"] = "train",
+    ):
+        """Compute the DPO loss and other metrics for the given batch of inputs for train or test."""
+        metrics = {}
+
+        (
+            policy_chosen_logps,
+            policy_rejected_logps,
+            policy_chosen_logits,
+            policy_rejected_logits,
+        ) = self.concatenated_forward(model, batch)
+        with torch.no_grad():
+            if self.ref_model is None:
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    (
+                        reference_chosen_logps,
+                        reference_rejected_logps,
+                        _,
+                        _,
+                    ) = self.concatenated_forward(self.model, batch)
+            else:
+                (
+                    reference_chosen_logps,
+                    reference_rejected_logps,
+                    _,
+                    _,
+                ) = self.concatenated_forward(self.ref_model, batch)
+
+        losses, chosen_rewards, rejected_rewards = self.dpo_loss(
+            policy_chosen_logps,
+            policy_rejected_logps,
+            reference_chosen_logps,
+            reference_rejected_logps,
+        )
+        reward_accuracies = (chosen_rewards > rejected_rewards).float()
+
+        # https://nlp.stanford.edu/IR-book/html/htmledition/extended-language-modeling-approaches-1.html
+        # https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
+        # KL-div는 확률값끼리 비교하기 때문에 찢어놨던 logps를 다시 폴리시, ref 각각 합쳐줌
+        policy_logps = torch.cat((policy_chosen_logps, policy_rejected_logps), dim=0) # add
+        reference_logps = torch.cat((reference_chosen_logps, reference_rejected_logps), dim=0) # add
+        kl_loss = nn.KLDivLoss(reduction="batchmean", log_target=True) # add
+        KL_div = kl_loss(policy_logps, reference_logps) # add
+
+        prefix = "eval_" if train_eval == "eval" else ""
+        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.cpu().mean()
+        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.cpu().mean()
+        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.cpu().mean()
+        metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).cpu().mean()
+        metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().cpu().mean()
+        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().cpu().mean()
+        metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().cpu().mean()
+        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().cpu().mean()
+        metrics[f"{prefix}KL_div"] = KL_div.detach().cpu().mean() # add
+        
+        return losses.mean(), metrics
+
+
+
+
 
 # Define and parse arguments.
 @dataclass
@@ -143,14 +290,12 @@ if __name__ == "__main__":
     )
 
     # 5. initialize the DPO trainer
-    dpo_trainer = DPOTrainer(
-        get_peft_model(model, peft_config),
-        #model,
-        #model_ref,
+    dpo_trainer = PPOTrainer_wrapper(
+        model=get_peft_model(model, peft_config),
         args=training_args,
         beta=script_args.beta,
         train_dataset=dataset['train'],
-        eval_dataset=dataset['test'],
+        eval_dataset=dataset['test'][:10],
         tokenizer=tokenizer,
         peft_config=peft_config,
         max_prompt_length=script_args.max_prompt_length,
