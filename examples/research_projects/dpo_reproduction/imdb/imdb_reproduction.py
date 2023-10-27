@@ -23,75 +23,20 @@ class PPOTrainer_wrapper(DPOTrainer):
      - we need KL-div and reward for vaildation step
      - so override some functions() and logging.
     """
-    def __init__(
-        self,
-        model: Union[PreTrainedModel, nn.Module] = None,
-        ref_model: Optional[Union[PreTrainedModel, nn.Module]] = None,
-        reward_model_name : str  = "siebert/sentiment-roberta-large-english",
-        return_KL_div : bool = True,
-        beta: float = 0.1,
-        loss_type: Literal["sigmoid", "hinge"] = "sigmoid",
-        args: TrainingArguments = None,
-        data_collator: Optional[DataCollator] = None,
-        label_pad_token_id: int = -100,
-        padding_value: int = 0,
-        truncation_mode: str = "keep_end",
-        train_dataset: Optional[Dataset] = None,
-        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
-        tokenizer: Optional[PreTrainedTokenizerBase] = None,
-        model_init: Optional[Callable[[], PreTrainedModel]] = None,
-        callbacks: Optional[List[TrainerCallback]] = None,
-        optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (
-            None,
-            None,
-        ),
-        preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
-        max_length: Optional[int] = None,
-        max_prompt_length: Optional[int] = None,
-        max_target_length: Optional[int] = None,
-        peft_config: Optional[Dict] = None,
-        is_encoder_decoder: Optional[bool] = None,
-        disable_dropout: bool = True,
-        generate_during_eval: bool = False,
-        compute_metrics: Optional[Callable[[EvalLoopOutput], Dict]] = None,
-    ):
+    def __init__(self, *args, **kargs):
         """
-        Added Args:
-            reward_model (`transformers.PreTrainedModel`):
+        Added kargs:
+            reward_model_name (`transformers.PreTrainedModel`):
                 The model to logging sentimental reward in evaluation step, preferably an `AutoModelForSequenceClassification`.
             return_KL_div (`bool`, defaults to True):
                 return KL divergence and log them
         """
-        super().__init__(
-            model = model,
-            ref_model = ref_model,
-            beta = beta,
-            # loss_type = loss_type, # ?? why ????
-            args = args,
-            data_collator = data_collator,
-            label_pad_token_id = label_pad_token_id,
-            padding_value = padding_value,
-            truncation_mode = truncation_mode,
-            train_dataset = train_dataset,
-            eval_dataset = eval_dataset,
-            tokenizer = tokenizer,
-            model_init = model_init,
-            callbacks = callbacks,
-            optimizers = optimizers,
-            preprocess_logits_for_metrics = preprocess_logits_for_metrics,
-            max_length = max_length,
-            max_prompt_length = max_prompt_length,
-            max_target_length = max_target_length,
-            peft_config = peft_config,
-            is_encoder_decoder = is_encoder_decoder,
-            disable_dropout = disable_dropout,
-            generate_during_eval = generate_during_eval,
-            compute_metrics = compute_metrics,
-        )
-        
-        if reward_model_name is None:
+        if 'reward_model_name' in kargs.keys():
+            reward_model_name = kargs.pop('reward_model_name')
             self.reward_pipe = pipeline("text-classification", model=reward_model_name)
-        self.return_KL_div = return_KL_div
+        if 'return_KL_div' in kargs.keys():
+            self.return_KL_div = kargs.pop('return_KL_div')
+        super().__init__(*args, **kargs)
 
 
     def get_batch_metrics(
