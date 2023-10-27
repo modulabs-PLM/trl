@@ -39,67 +39,70 @@ class PPOTrainer_wrapper(DPOTrainer):
         super().__init__(*args, **kargs)
 
 
-    def get_batch_metrics(
-        self,
-        model,
-        batch: Dict[str, Union[List, torch.LongTensor]],
-        train_eval: Literal["train", "eval"] = "train",
-    ):
-        """Compute the DPO loss and other metrics for the given batch of inputs for train or test."""
-        metrics = {}
+    def evaluation_loop(self, *args, **kwargs) -> EvalLoopOutput:
+        """
+        Overriding DPO evaluation_loop to store metrics for each batch.
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
 
-        (
-            policy_chosen_logps,
-            policy_rejected_logps,
-            policy_chosen_logits,
-            policy_rejected_logits,
-        ) = self.concatenated_forward(model, batch)
-        with torch.no_grad():
-            if self.ref_model is None:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    (
-                        reference_chosen_logps,
-                        reference_rejected_logps,
-                        _,
-                        _,
-                    ) = self.concatenated_forward(self.model, batch)
-            else:
-                (
-                    reference_chosen_logps,
-                    reference_rejected_logps,
-                    _,
-                    _,
-                ) = self.concatenated_forward(self.ref_model, batch)
+        Works both with or without labels.
 
-        losses, chosen_rewards, rejected_rewards = self.dpo_loss(
-            policy_chosen_logps,
-            policy_rejected_logps,
-            reference_chosen_logps,
-            reference_rejected_logps,
-        )
-        reward_accuracies = (chosen_rewards > rejected_rewards).float()
-
-        # https://nlp.stanford.edu/IR-book/html/htmledition/extended-language-modeling-approaches-1.html
-        # https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
-        # .
-        # KL-div는 확률값끼리 비교하기 때문에 찢어놨던 logps를 다시 폴리시, ref 각각 합쳐줌
-        policy_logps = torch.cat((policy_chosen_logps, policy_rejected_logps), dim=0) # add
-        reference_logps = torch.cat((reference_chosen_logps, reference_rejected_logps), dim=0) # add
-        kl_loss = nn.KLDivLoss(reduction="batchmean", log_target=True) # add
-        KL_div = kl_loss(policy_logps, reference_logps) # add
-
-        prefix = "eval_" if train_eval == "eval" else ""
-        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.cpu().mean()
-        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.cpu().mean()
-        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.cpu().mean()
-        metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).cpu().mean()
-        metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().cpu().mean()
-        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().cpu().mean()
-        metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().cpu().mean()
-        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().cpu().mean()
-        metrics[f"{prefix}KL_div"] = KL_div.detach().cpu().mean() # add
+        ** This is pseudocode!!**
+        """
+        initial_output = super().evaluation_loop(*args, **kwargs)
+        if self.reward_pipe is not None and self.return_KL_div is not None:
+            KL_div, reward = self.KL_div_and_reward(*args, **kwargs)
+            initial_output['KL_div'] = KL_div
+            initial_output['KL_div'] = reward
         
-        return losses.mean(), metrics
+        return initial_output
+        
+    
+    def KL_div_and_reward(self, *args, **kwargs):
+        """
+        ** This is pseudocode!!**
+        """
+        # Generate random indices within the range of the total number of samples
+        num_samples = len(dataloader.dataset)
+        random_indices = random.sample(range(num_samples), k=self.args.eval_batch_size)
+
+        # Use dataloader.dataset.select to get the random batch without iterating over the DataLoader
+        random_batch_dataset = dataloader.dataset.select(random_indices)
+        random_batch = self.data_collator(random_batch_dataset)
+        random_batch = self._prepare_inputs(random_batch)
+
+        # KL_div
+        policy_logits = model(
+            random_batch["input_ids"],
+            attention_mask=random_batch["attention_mask"],
+            **model_kwargs,
+        ).logits.to(torch.float32)
+
+        policy_logps = self._get_batch_logps(
+            policy_logits,
+            random_batch["labels"],
+            average_log_prob=False,
+        )
+
+        ref_logits = self.ref_model(
+            random_batch["input_ids"],
+            attention_mask=random_batch["attention_mask"],
+            **model_kwargs,
+        ).logits.to(torch.float32)
+
+        ref_logps = self._get_batch_logps(
+            ref_logits,
+            random_batch["labels"],
+            average_log_prob=False,
+        )
+        kl_loss = nn.KLDivLoss(reduction="batchmean", log_target=True)
+        KL_div = kl_loss(policy_logps, ref_logps)
+
+        # reward score 
+        reward = self.reward_pipe(random_batch["prompt"])
+
+        self.log(KL_div, reward)
+        return KL_div, reward
+
 
 
 
