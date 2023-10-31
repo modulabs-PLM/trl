@@ -1,10 +1,12 @@
 # 0. imports
 import os
+import random
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Union, Literal, Callable, List, Tuple
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader # add
 from datasets import Dataset, load_dataset
 from peft import AutoPeftModelForCausalLM, LoraConfig, get_peft_model
 
@@ -15,9 +17,10 @@ from transformers.trainer_utils import EvalLoopOutput # add
 from transformers import pipeline # add
 from trl import DPOTrainer
 from tqdm import tqdm
+from trl.trainer.utils import DPODataCollatorWithPadding, pad_to_length
 
 
-class PPOTrainer_wrapper(DPOTrainer):
+class DPOTrainer_wrapper(DPOTrainer):
     """
      - for reproduct fig2 in DPO
      - we need KL-div and reward for vaildation step
@@ -33,87 +36,160 @@ class PPOTrainer_wrapper(DPOTrainer):
         """
         if 'reward_model_name' in kargs.keys():
             reward_model_name = kargs.pop('reward_model_name')
-            self.reward_pipe = pipeline("text-classification", model=reward_model_name)
+            device = torch.device("cuda")
+            self.reward_pipe = pipeline("text-classification", model=reward_model_name, device=device)
         if 'return_KL_div' in kargs.keys():
             self.return_KL_div = kargs.pop('return_KL_div')
         super().__init__(*args, **kargs)
 
 
-    def evaluation_loop(self, *args, **kwargs) -> EvalLoopOutput:
+    def evaluation_loop(
+        self,
+        dataloader: DataLoader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> EvalLoopOutput:
         """
         Overriding DPO evaluation_loop to store metrics for each batch.
         Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
 
         Works both with or without labels.
 
-        ** This is pseudocode!!**
         """
-        initial_output = super().evaluation_loop(*args, **kwargs)
+
+        # get KL_div and reward
         if self.reward_pipe is not None and self.return_KL_div is not None:
-            KL_div, reward = self.KL_div_and_reward(*args, **kwargs)
-            initial_output['KL_div'] = KL_div
-            initial_output['KL_div'] = reward
-        
+            KL_div = self.get_KL_div(dataloader)
+            avg_reward = self.get_reward(dataloader)
+            self.log({
+                "KL_div" : KL_div,
+                "avg_reward" : avg_reward
+            })
+            
+
+        # Base evaluation
+        initial_output = super().evaluation_loop(
+            dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
+        )
+
         return initial_output
         
     
-    def KL_div_and_reward(self, *args, **kwargs):
+    def get_KL_div(self, dataloader: DataLoader):
         """
-        ** This is pseudocode!!**
+        get KL_div
         """
-        # Generate random indices within the range of the total number of samples
-        num_samples = len(dataloader.dataset)
-        random_indices = random.sample(range(num_samples), k=self.args.eval_batch_size)
+        # 데이터 로더에서 iter 할 수 없음.. 왜이런지 모르겠네 그냥 리스트를 그대로 씀
+        prompts :List[str]= dataloader.dataset
 
-        # Use dataloader.dataset.select to get the random batch without iterating over the DataLoader
-        random_batch_dataset = dataloader.dataset.select(random_indices)
-        random_batch = self.data_collator(random_batch_dataset)
-        random_batch = self._prepare_inputs(random_batch)
+        # 토크나이저로 인풋들을 짤라줌
+        prompt_tokens = self.tokenizer(
+            prompts, 
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            # padding_side='left',
+            return_tensors='pt'
+        )# 이거 이상함... 왜 토큰수가 들쭉날쭉이지.. 데이터 생산할때 토큰 보고 잘랐을텐데..
 
+        # 텐서로 바꾸는 과정
+        prompt_tokens = self._prepare_inputs(prompt_tokens)
+        
         # KL_div
-        policy_logits = model(
-            random_batch["input_ids"],
-            attention_mask=random_batch["attention_mask"],
-            **model_kwargs,
+        # 모델에 프롬프트를 넣고 인퍼런스 후 로그확률을 뽑음.
+        # 왜냐하면 KL_div에다가 둘다 로그확률 넣을것이기 때문.
+        # 논문에 시퀀스레벨로 KL_div 쟀다고 나와있음.
+        policy_logps = self.model(
+            prompt_tokens["input_ids"],
+            attention_mask=prompt_tokens["attention_mask"],
         ).logits.to(torch.float32)
+        policy_logps = policy_logps.log_softmax(-1)
 
-        policy_logps = self._get_batch_logps(
-            policy_logits,
-            random_batch["labels"],
-            average_log_prob=False,
-        )
+        with torch.no_grad():
+            # peft 모델인 경우 어뎁터 땐걸 레퍼런스로 사용
+            if self.ref_model is None:
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    ref_logps = self.model(
+                        prompt_tokens["input_ids"],
+                        attention_mask=prompt_tokens["attention_mask"],
+                    ).logits.to(torch.float32)
+            else:
+                ref_logps = self.ref_model(
+                    prompt_tokens["input_ids"],
+                    attention_mask=prompt_tokens["attention_mask"],
+                ).logits.to(torch.float32)
+            ref_logps = ref_logps.log_softmax(-1)
 
-        ref_logits = self.ref_model(
-            random_batch["input_ids"],
-            attention_mask=random_batch["attention_mask"],
-            **model_kwargs,
-        ).logits.to(torch.float32)
-
-        ref_logps = self._get_batch_logps(
-            ref_logits,
-            random_batch["labels"],
-            average_log_prob=False,
-        )
+        # calculate KLDiv
+        # 이것도 시퀀스별로 재고있는지 확인해야함
         kl_loss = nn.KLDivLoss(reduction="batchmean", log_target=True)
         KL_div = kl_loss(policy_logps, ref_logps)
 
-        # reward score 
-        reward = self.reward_pipe(random_batch["prompt"])
+        return KL_div
 
-        self.log(KL_div, reward)
-        return KL_div, reward
+        
 
+    def get_reward(self, dataloader: DataLoader):
+        """
+        get reward from generated words
+        """
+        # 데이터 로더에서 iter 할 수 없음.. 왜이런지 모르겠네 그냥 리스트를 그대로 씀
+        prompts :List[str]= dataloader.dataset
 
+        # 토크나이저로 인풋들을 짤라줌
+        prompt_tokens = self.tokenizer(
+            prompts, 
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            # padding_side='left',
+            return_tensors='pt'
+        )# 이거 이상함... 왜 토큰수가 들쭉날쭉이지.. 데이터 생산할때 토큰 보고 잘랐을텐데..
 
+        # 텐서로 바꾸는 과정
+        prompt_tokens = self._prepare_inputs(prompt_tokens)
 
+        # 문장 생성 및 디코딩
+        policy_output = self.model.generate(
+            #https://github.com/huggingface/peft/issues/708
+            input_ids=prompt_tokens["input_ids"],
+            attention_mask=prompt_tokens["attention_mask"],
+            max_length=self.max_length,
+            do_sample=True,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+        policy_output = pad_to_length(policy_output, self.max_length, self.tokenizer.pad_token_id)
+        policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
 
+        # avg reward score(0~1)
+        tokenizer_kwargs = {'padding':True,'truncation':True,'max_length':512}
+        rewards = self.reward_pipe(policy_output_decoded, **tokenizer_kwargs)
+        rewards = [dic['score'] if dic['label']=='POSITIVE' else -dic['score']  for dic in rewards]
+        # nomalize (-1~1) to (0~1)
+        rewards = [(i+1)/2 for i in rewards]
+        avg_reward = sum(rewards) / len(rewards)
 
+        return avg_reward
+
+        
+        
+        
 # Define and parse arguments.
 @dataclass
 class ScriptArguments:
     """
     The arguments for the DPO training script.
     """
+    return_KL_div: Optional[bool] = field(
+        default=True, metadata={"help": "whether to use KL div"}
+    )
+    # sentimental classifer model name (reward_model)
+    reward_model_name: str = field(
+        default='siebert/sentiment-roberta-large-english',
+        metadata={"help":"Model name suitable for classify generated texts"}
+    )
 
     # data parameters
     beta: Optional[float] = field(default=0.1, metadata={"help": "the beta parameter for DPO loss"})
@@ -173,13 +249,14 @@ class ScriptArguments:
     )
 
 
+
 if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
 
     # 1. load a pretrained model
     model = AutoModelForCausalLM.from_pretrained(script_args.model_name_or_path)
-    tokenizer = AutoTokenizer.from_pretrained("gpt2-large")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2-large", padding_side='left')
     tokenizer.pad_token = tokenizer.eos_token
 
     # 2. Load the imdb paired dataset
@@ -239,16 +316,18 @@ if __name__ == "__main__":
     )
 
     # 5. initialize the DPO trainer
-    dpo_trainer = PPOTrainer_wrapper(
+    dpo_trainer = DPOTrainer_wrapper(
         model=get_peft_model(model, peft_config),
         args=training_args,
         beta=script_args.beta,
         train_dataset=dataset['train'],
-        eval_dataset=dataset['test'][:10],
+        eval_dataset=dataset['test'][:10], # 우선 임시로.. 근데 이러면 안됨
         tokenizer=tokenizer,
         peft_config=peft_config,
         max_prompt_length=script_args.max_prompt_length,
         max_length=script_args.max_length,
+        return_KL_div=script_args.return_KL_div,
+        reward_model_name=script_args.reward_model_name,
     )
 
     # 6. train
