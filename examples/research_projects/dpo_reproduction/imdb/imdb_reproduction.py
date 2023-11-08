@@ -60,6 +60,7 @@ class DPOTrainer_wrapper(DPOTrainer):
         """
 
         # get KL_div and reward for random sample
+        self.model.eval()
         if self.reward_pipe is not None and self.return_KL_div is not None:
             num_samples = len(dataloader.dataset)
             random_indices = random.sample(range(num_samples), k=self.args.eval_batch_size)
