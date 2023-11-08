@@ -69,45 +69,42 @@ class DPOTrainer_wrapper(DPOTrainer):
             })
             
 
-        # Base evaluation
-        initial_output = super().evaluation_loop(
-            dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
-        )
-
-        return initial_output
+        eval_dataset = getattr(dataloader, "dataset", None)
+        num_samples = len(eval_dataset)
+        return EvalLoopOutput(predictions=None, label_ids=None, metrics={}, num_samples=num_samples)
         
     
     def get_KL_div(self, dataloader: DataLoader):
         """
         get KL_div
         """
-        # 데이터 로더에서 iter 할 수 없음.. 왜이런지 모르겠네 그냥 리스트를 그대로 씀
-        prompts :List[str]= dataloader.dataset
-
-        # 토크나이저로 인풋들을 짤라줌
-        prompt_tokens = self.tokenizer(
-            prompts, 
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            # padding_side='left',
-            return_tensors='pt'
-        )# 이거 이상함... 왜 토큰수가 들쭉날쭉이지.. 데이터 생산할때 토큰 보고 잘랐을텐데..
-
-        # 텐서로 바꾸는 과정
-        prompt_tokens = self._prepare_inputs(prompt_tokens)
-        
-        # KL_div
-        # 모델에 프롬프트를 넣고 인퍼런스 후 로그확률을 뽑음.
-        # 왜냐하면 KL_div에다가 둘다 로그확률 넣을것이기 때문.
-        # 논문에 시퀀스레벨로 KL_div 쟀다고 나와있음.
-        policy_logps = self.model(
-            prompt_tokens["input_ids"],
-            attention_mask=prompt_tokens["attention_mask"],
-        ).logits.to(torch.float32)
-        policy_logps = policy_logps.log_softmax(-1)
-
         with torch.no_grad():
+            # 데이터 로더에서 iter 할 수 없음.. 왜이런지 모르겠네 그냥 리스트를 그대로 씀
+            prompts :List[str]= dataloader.dataset
+
+            # 토크나이저로 인풋들을 짤라줌
+            prompt_tokens = self.tokenizer(
+                prompts, 
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                # padding_side='left',
+                return_tensors='pt'
+            )# 이거 이상함... 왜 토큰수가 들쭉날쭉이지.. 데이터 생산할때 토큰 보고 잘랐을텐데..
+
+            # 텐서로 바꾸는 과정
+            prompt_tokens = self._prepare_inputs(prompt_tokens)
+            
+            # KL_div
+            # 모델에 프롬프트를 넣고 인퍼런스 후 로그확률을 뽑음.
+            # 왜냐하면 KL_div에다가 둘다 로그확률 넣을것이기 때문.
+            # 논문에 시퀀스레벨로 KL_div 쟀다고 나와있음.
+            policy_logps = self.model(
+                prompt_tokens["input_ids"],
+                attention_mask=prompt_tokens["attention_mask"],
+            ).logits.to(torch.float32)
+            policy_logps = policy_logps.log_softmax(-1)
+
             # peft 모델인 경우 어뎁터 땐걸 레퍼런스로 사용
             if self.ref_model is None:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
@@ -122,10 +119,10 @@ class DPOTrainer_wrapper(DPOTrainer):
                 ).logits.to(torch.float32)
             ref_logps = ref_logps.log_softmax(-1)
 
-        # calculate KLDiv
-        # 이것도 시퀀스별로 재고있는지 확인해야함
-        kl_loss = nn.KLDivLoss(reduction="batchmean", log_target=True)
-        KL_div = kl_loss(policy_logps, ref_logps)
+            # calculate KLDiv
+            # 이것도 시퀀스별로 재고있는지 확인해야함
+            kl_loss = nn.KLDivLoss(reduction="batchmean", log_target=True)
+            KL_div = kl_loss(policy_logps, ref_logps).item()
 
         return KL_div
 
@@ -275,6 +272,9 @@ if __name__ == "__main__":
         num_proc=script_args.num_proc,
         remove_columns=['text']
     )
+    train_dataset = dataset['train']
+    eval_dataset = dataset['test']
+    eval_dataset = eval_dataset.remove_columns(["chosen", "rejected"])
 
     # 3. initialize training arguments:
     training_args = TrainingArguments(
@@ -320,8 +320,8 @@ if __name__ == "__main__":
         model=get_peft_model(model, peft_config),
         args=training_args,
         beta=script_args.beta,
-        train_dataset=dataset['train'],
-        eval_dataset=dataset['test'][:10], # 우선 임시로.. 근데 이러면 안됨
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset[:10], # 우선 임시로.. 근데 이러면 안됨
         tokenizer=tokenizer,
         peft_config=peft_config,
         max_prompt_length=script_args.max_prompt_length,
