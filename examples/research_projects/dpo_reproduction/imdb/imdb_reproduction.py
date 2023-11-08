@@ -59,29 +59,31 @@ class DPOTrainer_wrapper(DPOTrainer):
 
         """
 
-        # get KL_div and reward
+        # get KL_div and reward for random sample
         if self.reward_pipe is not None and self.return_KL_div is not None:
-            KL_div = self.get_KL_div(dataloader)
-            avg_reward = self.get_reward(dataloader)
-            self.log({
+            num_samples = len(dataloader.dataset)
+            random_indices = random.sample(range(num_samples), k=self.args.eval_batch_size)
+            selected_prompts = [e['prompt'] for i,e in enumerate(dataloader.dataset) if i in random_indices]
+
+            KL_div = self.get_KL_div(selected_prompts)
+            avg_reward = self.get_reward(selected_prompts)
+            
+        return EvalLoopOutput(
+            predictions=None,
+            label_ids=None,
+            metrics={
                 "KL_div" : KL_div,
                 "avg_reward" : avg_reward
-            })
-            
-
-        eval_dataset = getattr(dataloader, "dataset", None)
-        num_samples = len(eval_dataset)
-        return EvalLoopOutput(predictions=None, label_ids=None, metrics={}, num_samples=num_samples)
+            },
+            num_samples=len(dataloader.dataset)
+        )
         
     
-    def get_KL_div(self, dataloader: DataLoader):
+    def get_KL_div(self, prompts: List[str]):
         """
         get KL_div
         """
         with torch.no_grad():
-            # 데이터 로더에서 iter 할 수 없음.. 왜이런지 모르겠네 그냥 리스트를 그대로 씀
-            prompts :List[str]= dataloader.dataset
-
             # 토크나이저로 인풋들을 짤라줌
             prompt_tokens = self.tokenizer(
                 prompts, 
@@ -128,12 +130,10 @@ class DPOTrainer_wrapper(DPOTrainer):
 
         
 
-    def get_reward(self, dataloader: DataLoader):
+    def get_reward(self, prompts: List[str]):
         """
         get reward from generated words
         """
-        # 데이터 로더에서 iter 할 수 없음.. 왜이런지 모르겠네 그냥 리스트를 그대로 씀
-        prompts :List[str]= dataloader.dataset
 
         # 토크나이저로 인풋들을 짤라줌
         prompt_tokens = self.tokenizer(
@@ -321,7 +321,7 @@ if __name__ == "__main__":
         args=training_args,
         beta=script_args.beta,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset[:10], # 우선 임시로.. 근데 이러면 안됨
+        eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         peft_config=peft_config,
         max_prompt_length=script_args.max_prompt_length,
