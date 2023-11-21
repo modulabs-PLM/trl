@@ -70,10 +70,13 @@ if __name__ == "__main__":
         cut_token,
         batched=True,
         num_proc=args.num_proc,
-        remove_columns='label'
+        #remove_columns='label'
     )
 
-    
+    #print(dataset)
+    #print(dataset['train'][0])
+
+
     # 텍스트 생성 파이프라인 불러오기
     g_pipe = pipeline(
         "text-generation",
@@ -93,30 +96,51 @@ if __name__ == "__main__":
         top_k=50,
         top_p=0.95,
         repetition_penalty=1,
-        num_return_sequences=2,
+        num_return_sequences=5,
     )
+
+    # 생성할 문장 개수에 따른 column 명
+    keys = ['g_' + str(key) for key in range(5)]
+    # 일단 dpo_imdb_dataset_dict에 [프롬프트] = {'생성1' : [생성문장1, 라벨, 스코어], '생성2' : [생성문장2, 라벨, 스코어] ...}
+    # 이런 느낌으로 저장한뒤 리스트의 라벨과 스코어를 기준으로 소팅등의 처리를 한다음 chosen과 reject을 선택하는 방법? 으로 갈까 생각중
 
     for split in dataset.keys():
         split_len= len(dataset[split])
-        for data, out in tqdm(zip(dataset[split], g_pipe(KeyDataset(dataset[split], "text"), **pipe_args)), total=split_len):
+        for data, out in tqdm(zip(dataset[split], g_pipe(KeyDataset(dataset[split], "tokens"), **pipe_args)), total=split_len):
             out = [i['generated_text'] for i in out]
-            dpo_imdb_dataset_dict[data['text']] = out
-    
+            dpo_imdb_dataset_dict[data['tokens']] = {key: [value] for key, value in zip(keys, out)}
+
     # 기존 dataset에 이어붙이기
+    
     dataset = dataset.map(
-        lambda x:{
-            'chosen':dpo_imdb_dataset_dict[x['text']][0],
-            'rejected':dpo_imdb_dataset_dict[x['text']][1]
-        }, 
-        batched=False, 
+        lambda x:{ key : dpo_imdb_dataset_dict[x['tokens']][key][0] for key in keys
+            # keys[idx] : dpo_imdb_dataset_dict[x['tokens']][idx] for idx in range(len(keys))
+            #'chosen':dpo_imdb_dataset_dict[x['text']][0]
+            #'rejected':dpo_imdb_dataset_dict[x['text']][1]
+        },
+        batched=False,
         num_proc=8
     )
 
+    print(dpo_imdb_dataset_dict)
+
     # GPU 메모리 절약
     del g_pipe
-    
+
     # 감성 분석 시작
     sentimental_pipe = pipeline("sentiment-analysis", model=args.sentimant_model_name, device_map='auto')
+    
+    # 일단은 무지성 for문..
+    for split in dataset.keys():
+        for idx in range(len(dataset[split])):
+            data = dataset[split][idx]
+            out = sentimental_pipe([data[i] for i in keys])
+            for key, value in zip(keys, out):
+                dpo_imdb_dataset_dict[data['tokens']][key].append(list(value.values()))
+                
+
+    #print(dpo_imdb_dataset_dict)
+    """
     for split in dataset.keys():
         for data, out in tqdm(
             zip(dataset[split],
@@ -127,6 +151,8 @@ if __name__ == "__main__":
         ):
             # 앞에께 좋으면 NEGATIVE, 뒤에께 좋으면 POSITIVE
             dpo_imdb_dataset_dict[data['text']].append(out['label'])
+    """
+    """        
 
     # dpo_imdb_dataset_dict에 기록해놓은 감성 분석 결과를 토대로 y_w와 y_l 만들기
     def sorting_from_sentimental_alaysis(example):
@@ -150,3 +176,4 @@ if __name__ == "__main__":
                 print(f"[{k}] :")
                 print(v)
             print()
+    """
