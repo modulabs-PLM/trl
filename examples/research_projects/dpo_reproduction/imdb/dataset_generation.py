@@ -23,12 +23,14 @@ class ScriptArguments:
     tokenizer_name: str = field(default='gpt2-large', metadata={"help":"default is gpt2-large"})
     generation_model_name: str = field(default='insub/gpt2-large-imdb-fine-tuned', metadata={"help":"Model name suitable for dataset generation"})
 
-    cut_tokens: Optional[int] = field(default=3, metadata={"help": "cut all but the first 15 tokens."})
+    cut_tokens: Optional[int] = field(default=3, metadata={"help": "cut all but the first N tokens."})
     dataset_name: str = field(default='imdb', metadata={"help":"default is imdb"})
     num_proc: Optional[int] = field(default=8, metadata={"help": "number of proc"})
     gen_max_length: Optional[int] = field(default=100, metadata={"help": "generated texts length"})
     gen_batch_size: Optional[int] = field(default=20, metadata={"help": "generation batch size"})
     num_return_sequences: Optional[int] = field(default=10, metadata={"help": "generation return sequence(more better)"})
+
+    repeat_all: Optional[int] = field(default=2, metadata={"help": "repeat all process N times"})
 
     # sentimental classify parameters
     sentimant_model_name: str = field(default='siebert/sentiment-roberta-large-english', metadata={"help":"Model name suitable for classify generated texts"})
@@ -111,7 +113,7 @@ if __name__ == "__main__":
         device_map='auto',
     )
     
-        # 감성분석 파이프라인 불러오기
+    # 감성분석 파이프라인 불러오기
     sentimental_pipe = pipeline("sentiment-analysis", model="siebert/sentiment-roberta-large-english", device_map='auto')
     
     def generate_data(dataset, generation_pipe):
@@ -148,10 +150,11 @@ if __name__ == "__main__":
                         dataset[split],
                         sentimental_pipe(
                             KeyDataset(dataset[split][generated_col], "text"),
-                            batch_size=13,
+                            batch_size=args.sent_batch_size,
                         )
                     )):
                     score = out['score'] if out['label']=='POSITIVE' else -out['score']
+                    # [-1~1] -> [0~1]
                     score = (score+1)/2
                     idx = data['index']
                     sentimental_dict[idx][generated_col]=score
@@ -178,8 +181,8 @@ if __name__ == "__main__":
     
         return example
     
-    # 우선 2번 반복
-    for _ in tqdm(range(2)):
+    # 해당 과정 N번 반복
+    for _ in tqdm(range(args.repeat_all)):
         # 데이터생성 및 붙이기
         dpo_imdb_dataset_dict = generate_data(dataset, generation_pipe)
         dataset = dataset.map(attach_generate_data, batched=False, num_proc=8)
