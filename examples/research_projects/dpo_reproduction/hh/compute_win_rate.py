@@ -9,7 +9,7 @@ import random
 # %% ###########################################################################
 # Set Variables
 ################################################################################
-api_key = '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'
+openai_key_path = '/data/private/tshahn/dpo/.openai_key'
 output_sft_path = 'answers_dpo.pkl'
 output_dpo_path = 'answers_sft.pkl'
 
@@ -82,7 +82,10 @@ for context, cs, cd in zip(contexts, completions_sft, completions_dpo):
 # %% ###########################################################################
 #  Ask for Judgement of GPT
 ################################################################################
-client = openai.OpenAI(api_key=api_key)
+with open(openai_key_path, mode='r') as f:
+    openai_key = f.readline().strip()
+
+client = openai.OpenAI(api_key=openai_key)
 gpt_outputs = [ call_gpt(msg) for msg in templated_messages ]
 
 
