@@ -1,0 +1,27 @@
+{
+  "_data_files": [
+    {
+      "filename": "data-00000-of-00001.arrow"
+    }
+  ],
+  "_fingerprint": "c4888245bfe260b8",
+  "_format_columns": [
+    "Question",
+    "Answer_0",
+    "Answer_score_0",
+    "Answer_1",
+    "Answer_score_1",
+    "Answer_2",
+    "Answer_score_2",
+    "Answer_3",
+    "Answer_score_3",
+    "Answer_4",
+    "Answer_score_4",
+    "Answer_5",
+    "Answer_score_5"
+  ],
+  "_format_kwargs": {},
+  "_format_type": null,
+  "_output_all_columns": false,
+  "_split": null
+}

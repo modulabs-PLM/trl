@@ -1,0 +1,60 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "Question": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Answer_0": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Answer_score_0": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "Answer_1": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Answer_score_1": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "Answer_2": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Answer_score_2": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "Answer_3": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Answer_score_3": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Answer_4": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Answer_score_4": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Answer_5": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "Answer_score_5": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}
