@@ -6,7 +6,7 @@ from typing import Dict, Optional
 import torch
 from datasets import Dataset, load_dataset
 from peft import AutoPeftModelForCausalLM, LoraConfig
-from transformers import AutoTokenizer, HfArgumentParser, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, TrainingArguments
 
 from trl import DPOTrainer
 
@@ -28,11 +28,12 @@ class ScriptArguments:
     )
     learning_rate: Optional[float] = field(default=5e-4, metadata={"help": "optimizer learning rate"})
     lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "the lr scheduler type"})
-    warmup_steps: Optional[int] = field(default=100, metadata={"help": "the number of warmup steps"})
+    # warmup_steps: Optional[int] = field(default=100, metadata={"help": "the number of warmup steps"})
+    warmup_steps: Optional[int] = field(default=0, metadata={"help": "the number of warmup steps"})
     weight_decay: Optional[float] = field(default=0.05, metadata={"help": "the weight decay"})
     optimizer_type: Optional[str] = field(default="paged_adamw_32bit", metadata={"help": "the optimizer type"})
 
-    per_device_train_batch_size: Optional[int] = field(default=4, metadata={"help": "train batch size per device"})
+    per_device_train_batch_size: Optional[int] = field(default=2, metadata={"help": "train batch size per device"})
     per_device_eval_batch_size: Optional[int] = field(default=1, metadata={"help": "eval batch size per device"})
     gradient_accumulation_steps: Optional[int] = field(
         default=4, metadata={"help": "the number of gradient accumulation steps"}
@@ -46,8 +47,10 @@ class ScriptArguments:
     lora_r: Optional[int] = field(default=8, metadata={"help": "the lora r parameter"})
 
     max_prompt_length: Optional[int] = field(default=512, metadata={"help": "the maximum prompt length"})
-    max_length: Optional[int] = field(default=1024, metadata={"help": "the maximum sequence length"})
-    max_steps: Optional[int] = field(default=1000, metadata={"help": "max number of training steps"})
+    # max_length: Optional[int] = field(default=1024, metadata={"help": "the maximum sequence length"})
+    max_length: Optional[int] = field(default=2048, metadata={"help": "the maximum sequence length"})
+    # max_steps: Optional[int] = field(default=1000, metadata={"help": "max number of training steps"})
+    max_steps: Optional[int] = field(default=1, metadata={"help": "max number of training steps"})
     logging_steps: Optional[int] = field(default=10, metadata={"help": "the logging frequency"})
     save_steps: Optional[int] = field(default=100, metadata={"help": "the saving frequency"})
     eval_steps: Optional[int] = field(default=100, metadata={"help": "the evaluation frequency"})
@@ -81,7 +84,7 @@ def get_stack_exchange(
     cache_dir: str = None,
     num_proc=24,
 ) -> Dataset:
-    """Load the stack-exchange-paired dataset from Hugging Face and convert it to the necessary format.
+    """Load the stack-exchange dataset from Hugging Face and convert it to the necessary format.
 
     The dataset is converted to a dictionary with the following structure:
     {
@@ -98,39 +101,20 @@ def get_stack_exchange(
         data_files={'train':"../data/pmp-binarized/stackexchange.parquet"},
         split="train"
     )
-    print(dataset)
-    print(dataset[0])
-    from pprint import pprint
-    pprint(dict(dataset[0]))
-
-
-    """
-    dataset = load_dataset(
-        "lvwerra/stack-exchange-paired",
-        split="train",
-        cache_dir=cache_dir,
-        data_dir=data_dir,
-    )
-    original_columns = dataset.column_names
 
     if sanity_check:
         dataset = dataset.select(range(min(len(dataset), 1000)))
 
     def return_prompt_and_responses(samples) -> Dict[str, str]:
-        return {
-            "prompt": ["Question: " + question + "\n\nAnswer: " for question in samples["question"]],
-            "chosen": samples["response_j"],
-            "rejected": samples["response_k"],
-        }
+        samples["prompt"] = ["Question: " + question + "\n\nAnswer: " for question in samples["Question"]]
+        return samples
 
     return dataset.map(
         return_prompt_and_responses,
         batched=True,
         num_proc=num_proc,
-        remove_columns=original_columns,
+        remove_columns=["Question"],
     )
-    """
-    return None
 
 
 if __name__ == "__main__":
@@ -158,23 +142,36 @@ if __name__ == "__main__":
         torch_dtype=torch.float16,
         load_in_4bit=True,
     )
+    """
+    model = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Llama-2-7b-hf",
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.float16,
+        load_in_4bit=True,
+    )
+    model.config.use_cache = False
+
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
     tokenizer.pad_token = tokenizer.eos_token
-    """
-    # 2. Load the Stack-exchange paired dataset
+    
+    # 2. Load the Stack-exchange dataset
     train_dataset = get_stack_exchange(data_dir="data/rl", sanity_check=script_args.sanity_check)
-    """
-    train_dataset = train_dataset.filter(
-        lambda x: len(x["prompt"]) + len(x["chosen"]) <= script_args.max_length
-        and len(x["prompt"]) + len(x["rejected"]) <= script_args.max_length
-    )
 
+    
+    col_prefix = "Answer_score_"
+    dataset_max_sample = max([int(c.lstrip(col_prefix)) for c in train_dataset.column_names if c.startswith(col_prefix)])
+    for i in range(dataset_max_sample):
+        train_dataset = train_dataset.filter(
+            lambda x: len(x["prompt"]) + len(x[f"Answer_{i}"]) <= script_args.max_length
+        )
+    """
     # 3. Load evaluation dataset
     eval_dataset = get_stack_exchange_paired(data_dir="data/evaluation", sanity_check=True)
     eval_dataset = eval_dataset.filter(
         lambda x: len(x["prompt"]) + len(x["chosen"]) <= script_args.max_length
         and len(x["prompt"]) + len(x["rejected"]) <= script_args.max_length
     )
+    """
 
     # 4. initialize training arguments:
     training_args = TrainingArguments(
@@ -193,9 +190,9 @@ if __name__ == "__main__":
         lr_scheduler_type=script_args.lr_scheduler_type,
         warmup_steps=script_args.warmup_steps,
         optim=script_args.optimizer_type,
-        bf16=True,
+        bf16=False,
         remove_unused_columns=False,
-        run_name="dpo_llama2",
+        run_name="mdpo_llama2",
     )
 
     peft_config = LoraConfig(
@@ -218,11 +215,11 @@ if __name__ == "__main__":
     # 5. initialize the DPO trainer
     dpo_trainer = DPOTrainer(
         model,
-        model_ref,
+        #model_ref,
         args=training_args,
         beta=script_args.beta,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        #eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         peft_config=peft_config,
         max_prompt_length=script_args.max_prompt_length,
@@ -236,4 +233,3 @@ if __name__ == "__main__":
     # 7. save
     output_dir = os.path.join(script_args.output_dir, "final_checkpoint")
     dpo_trainer.model.save_pretrained(output_dir)
-    """
