@@ -1,14 +1,41 @@
 # 0. imports
 import os
+import inspect
 from dataclasses import dataclass, field
-from typing import Dict, Optional
-
+from typing import Dict, List, Optional, Union, Callable, Tuple
+import pandas as pd
 import torch
+import torch.nn.functional as F
+from torch import nn
 from datasets import Dataset, load_dataset
+from accelerate.utils import is_deepspeed_available, tqdm
 from peft import AutoPeftModelForCausalLM, LoraConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, TrainingArguments
+
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    HfArgumentParser,
+    TrainingArguments,
+    PreTrainedModel,
+    DataCollator,
+    PreTrainedTokenizerBase,
+    Trainer,
+    DataCollatorForLanguageModeling,
+    BitsAndBytesConfig
+)
+from transformers.trainer_callback import TrainerCallback
+from transformers.trainer_utils import EvalLoopOutput
 
 from trl import DPOTrainer
+from trl.models import PreTrainedModelWrapper, create_reference_model
+from trl.import_utils import is_peft_available, is_wandb_available
+from trl.trainer.utils import (
+    disable_dropout_in_model,
+    pad_to_length,
+    peft_module_casting_to_bf16,
+    trl_sanitze_kwargs_for_tagging,
+)
+from trl  import DPOTrainer
 
 
 # Define and parse arguments.
@@ -34,9 +61,9 @@ class ScriptArguments:
     optimizer_type: Optional[str] = field(default="paged_adamw_32bit", metadata={"help": "the optimizer type"})
 
     per_device_train_batch_size: Optional[int] = field(default=2, metadata={"help": "train batch size per device"})
-    per_device_eval_batch_size: Optional[int] = field(default=1, metadata={"help": "eval batch size per device"})
+    per_device_eval_batch_size: Optional[int] = field(default=2, metadata={"help": "eval batch size per device"})
     gradient_accumulation_steps: Optional[int] = field(
-        default=4, metadata={"help": "the number of gradient accumulation steps"}
+        default=2, metadata={"help": "the number of gradient accumulation steps"}
     )
     gradient_checkpointing: Optional[bool] = field(
         default=True, metadata={"help": "whether to use gradient checkpointing"}
@@ -49,9 +76,8 @@ class ScriptArguments:
     max_prompt_length: Optional[int] = field(default=512, metadata={"help": "the maximum prompt length"})
     # max_length: Optional[int] = field(default=1024, metadata={"help": "the maximum sequence length"})
     max_length: Optional[int] = field(default=2048, metadata={"help": "the maximum sequence length"})
-    # max_steps: Optional[int] = field(default=1000, metadata={"help": "max number of training steps"})
-    max_steps: Optional[int] = field(default=1, metadata={"help": "max number of training steps"})
-    logging_steps: Optional[int] = field(default=10, metadata={"help": "the logging frequency"})
+    max_steps: Optional[int] = field(default=1000, metadata={"help": "max number of training steps"})
+    logging_steps: Optional[int] = field(default=5, metadata={"help": "the logging frequency"})
     save_steps: Optional[int] = field(default=100, metadata={"help": "the saving frequency"})
     eval_steps: Optional[int] = field(default=100, metadata={"help": "the evaluation frequency"})
 
@@ -59,9 +85,9 @@ class ScriptArguments:
     log_freq: Optional[int] = field(default=1, metadata={"help": "the logging frequency"})
 
     # instrumentation
-    sanity_check: Optional[bool] = field(default=False, metadata={"help": "only train on 1000 samples"})
+    sanity_check: Optional[bool] = field(default=True, metadata={"help": "only train on 1000 samples"})
     report_to: Optional[str] = field(
-        default="wandb",
+        default="none",
         metadata={
             "help": 'The list of integrations to report the results and logs to. Supported platforms are `"azure_ml"`,'
             '`"comet_ml"`, `"mlflow"`, `"neptune"`, `"tensorboard"`,`"clearml"` and `"wandb"`. '
@@ -77,7 +103,6 @@ class ScriptArguments:
         },
     )
 
-
 def get_stack_exchange(
     data_dir: str = "data/rl",
     sanity_check: bool = False,
@@ -89,67 +114,169 @@ def get_stack_exchange(
     The dataset is converted to a dictionary with the following structure:
     {
         'prompt': List[str],
-        'chosen': List[str],
-        'rejected': List[str],
+        'answer': List[str],
+        'score': List[folat]
     }
 
-    Prompts are structured as follows:
-      "Question: " + <prompt> + "\n\nAnswer: "
+    prompt are structured as follows:
+      "Question: " + <question> + "\n\nAnswer:"
     """
-    dataset = load_dataset(
-        "parquet",
-        data_files={'train':"../data/pmp-binarized/stackexchange.parquet"},
-        split="train"
-    )
-
+    
     if sanity_check:
+        dataset = load_dataset(
+            "lvwerra/stack-exchange-paired",
+            split="train[:1%]"
+        )
         dataset = dataset.select(range(min(len(dataset), 1000)))
-
+    else:
+        dataset = load_dataset(
+            "lvwerra/stack-exchange-paired",
+            split="train"
+        )
+    original_columns = dataset.column_names
+    
+    # TODO : this is dummy score -> should be removed
+    #################################################
+    import random
+    
+    dataset = dataset.map(
+        lambda x:{'score': random.uniform(-1, 1)},
+        batched=False,
+        num_proc=num_proc,
+    )
+    #################################################
+    
     def return_prompt_and_responses(samples) -> Dict[str, str]:
-        samples["prompt"] = ["Question: " + question + "\n\nAnswer: " for question in samples["Question"]]
+        samples["prompt"] = ["Question: " + question + "\n\nAnswer: " for question in samples["question"]]
         return samples
 
-    return dataset.map(
+    dataset = dataset.map(
         return_prompt_and_responses,
         batched=True,
         num_proc=num_proc,
-        remove_columns=["Question"],
+        remove_columns=[i for i in original_columns if i not in ['prompt', 'response_j']],
     )
+    dataset = dataset.rename_column('response_j', 'answer')
+    
+    dataset = dataset.filter(
+        lambda x: len(x["prompt"]) <= script_args.max_length
+    )
+
+    return dataset
+
+
+class MDPOTrainer(DPOTrainer):
+    
+    def __init__(self, *args, **kargs):
+        super().__init__(*args, **kargs)
+        
+        self.train_dataset = self.train_dataset.remove_columns(
+            [i for i in self.train_dataset.column_names if i not in ['score', 'input_ids', 'attention_mask']]
+        )
+        if self.eval_dataset:
+            self.eval_dataset = self.eval_dataset.remove_columns(
+                [i for i in self.eval_dataset.column_names if i not in ['score', 'input_ids', 'attention_mask']]
+            )
+        
+    
+    def tokenize_row(self, feature, model: Union[PreTrainedModel, nn.Module] = None) -> Dict:
+        """Tokenize a single row from a MDPO specific dataset.
+
+        At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation
+        in case the prompt + answer is/are too long.
+        """
+        
+        if not self.is_encoder_decoder:
+            
+            tokens = self.tokenizer(
+                feature['prompt'],
+                feature['answer'],
+                truncation=True,
+                max_length=self.max_length,
+                add_special_tokens=True,
+            )
+            feature.update(tokens)
+            return feature
+            
+        else:
+            raise NotImplementedError
+
+    def get_logps(
+        self,
+        model: Union[PreTrainedModel, nn.Module],
+        inputs:Dict['str',torch.Tensor]
+    )->torch.Tensor:
+        """
+        get log probabiliity of batch
+        
+        TODO : Fix -> per_token_logps should be calculated only answer, not prompt 
+        reference : https://github.com/huggingface/trl/blob/main/trl/trainer/dpo_trainer.py#L839
+        
+        loss_mask :              torch.Size([batch_size, seq_len])
+        logits :                 torch.Size([batch_size, seq_len, emb_dim])
+        logits.log_softmax(-1) : torch.Size([batch_size, seq_len, emb_dim])
+        per_token_logps :        torch.Size([batch_size, seq_len])
+        all_logps :              torch.Size([batch_size])
+               
+        """
+        
+        loss_mask = inputs['attention_mask'] != 0
+        
+        logits = model(**inputs).logits
+        per_token_logps = torch.gather(
+            logits.log_softmax(-1),
+            dim=2,
+            index=loss_mask.type(torch.int64).unsqueeze(2)
+        ).squeeze(2)
+        all_logps = (per_token_logps * loss_mask).sum(-1)
+        
+        return all_logps
+        
+        
+    def compute_loss(self, model, inputs, return_outputs=False):
+        score = inputs.pop("score")
+        
+        # forward pass
+        pi_logps = self.get_logps(model, inputs)
+        
+        # ref model pass
+        with torch.no_grad():
+            if self.ref_model is None:
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    ref_logps = self.get_logps(model, inputs)
+            else:
+                ref_logps = self.get_logps(self.ref_model, inputs)
+        
+        logits = pi_logps - ref_logps
+        loss = -F.logsigmoid(self.beta * score * logits) * (1 - self.label_smoothing)
+        
+        return loss
 
 
 if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
-    script_args = parser.parse_args_into_dataclasses()[0]
-    """
+    script_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)[0]
+    
     # 1. load a pretrained model
-    model = AutoPeftModelForCausalLM.from_pretrained(
-        script_args.model_name_or_path,
-        low_cpu_mem_usage=True,
-        torch_dtype=torch.float16,
-        load_in_4bit=True,
-    )
-    model.config.use_cache = False
-
-    if script_args.ignore_bias_buffers:
-        # torch distributed hack
-        model._ddp_params_and_buffers_to_ignore = [
-            name for name, buffer in model.named_buffers() if buffer.dtype == torch.bool
-        ]
-
-    model_ref = AutoPeftModelForCausalLM.from_pretrained(
-        script_args.model_name_or_path,
-        low_cpu_mem_usage=True,
-        torch_dtype=torch.float16,
-        load_in_4bit=True,
-    )
-    """
     model = AutoModelForCausalLM.from_pretrained(
         "meta-llama/Llama-2-7b-hf",
         low_cpu_mem_usage=True,
         torch_dtype=torch.float16,
         load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16
+    )
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", padding=True, truncation=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    model_ref = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Llama-2-7b-hf",
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.float16,
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16
     )
     model.config.use_cache = False
+    
 
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
     tokenizer.pad_token = tokenizer.eos_token
@@ -158,12 +285,7 @@ if __name__ == "__main__":
     train_dataset = get_stack_exchange(data_dir="data/rl", sanity_check=script_args.sanity_check)
 
     
-    col_prefix = "Answer_score_"
-    dataset_max_sample = max([int(c.lstrip(col_prefix)) for c in train_dataset.column_names if c.startswith(col_prefix)])
-    for i in range(dataset_max_sample):
-        train_dataset = train_dataset.filter(
-            lambda x: len(x["prompt"]) + len(x[f"Answer_{i}"]) <= script_args.max_length
-        )
+    
     """
     # 3. Load evaluation dataset
     eval_dataset = get_stack_exchange_paired(data_dir="data/evaluation", sanity_check=True)
@@ -190,11 +312,12 @@ if __name__ == "__main__":
         lr_scheduler_type=script_args.lr_scheduler_type,
         warmup_steps=script_args.warmup_steps,
         optim=script_args.optimizer_type,
-        bf16=False,
+        bf16=True,
         remove_unused_columns=False,
         run_name="mdpo_llama2",
     )
-
+    
+    
     peft_config = LoraConfig(
         r=script_args.lora_r,
         lora_alpha=script_args.lora_alpha,
@@ -212,24 +335,27 @@ if __name__ == "__main__":
         task_type="CAUSAL_LM",
     )
 
-    # 5. initialize the DPO trainer
-    dpo_trainer = DPOTrainer(
+    # 5. initialize the MDPO trainer
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    mdpo_trainer = MDPOTrainer(
         model,
-        #model_ref,
+        model_ref,
         args=training_args,
         beta=script_args.beta,
         train_dataset=train_dataset,
-        #eval_dataset=eval_dataset,
+        eval_dataset=train_dataset,
         tokenizer=tokenizer,
         peft_config=peft_config,
         max_prompt_length=script_args.max_prompt_length,
         max_length=script_args.max_length,
+        data_collator = data_collator
     )
 
     # 6. train
-    dpo_trainer.train()
-    dpo_trainer.save_model(script_args.output_dir)
+    mdpo_trainer.train()
+    mdpo_trainer.save_model(script_args.output_dir)
 
     # 7. save
     output_dir = os.path.join(script_args.output_dir, "final_checkpoint")
-    dpo_trainer.model.save_pretrained(output_dir)
+    mdpo_trainer.model.save_pretrained(output_dir)
