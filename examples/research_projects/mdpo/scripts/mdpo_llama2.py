@@ -2,7 +2,7 @@
 import os
 import inspect
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Callable, Tuple
+from typing import Dict, List, Optional, Union, Callable, Tuple, Any
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -77,12 +77,12 @@ class ScriptArguments:
     # max_length: Optional[int] = field(default=1024, metadata={"help": "the maximum sequence length"})
     max_length: Optional[int] = field(default=2048, metadata={"help": "the maximum sequence length"})
     max_steps: Optional[int] = field(default=1000, metadata={"help": "max number of training steps"})
-    logging_steps: Optional[int] = field(default=5, metadata={"help": "the logging frequency"})
+    logging_steps: Optional[int] = field(default=10, metadata={"help": "the logging frequency"})
     save_steps: Optional[int] = field(default=100, metadata={"help": "the saving frequency"})
     eval_steps: Optional[int] = field(default=100, metadata={"help": "the evaluation frequency"})
 
     output_dir: Optional[str] = field(default="./results", metadata={"help": "the output directory"})
-    log_freq: Optional[int] = field(default=1, metadata={"help": "the logging frequency"})
+    log_freq: Optional[int] = field(default=10, metadata={"help": "the logging frequency"})
 
     # instrumentation
     sanity_check: Optional[bool] = field(default=True, metadata={"help": "only train on 1000 samples"})
@@ -251,6 +251,19 @@ class MDPOTrainer(DPOTrainer):
         loss = -F.logsigmoid(self.beta * score * logits) * (1 - self.label_smoothing)
         
         return loss
+
+    
+    def prediction_step(
+        self,
+        model: Union[PreTrainedModel, nn.Module],
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ):
+        with torch.no_grad():
+            loss = self.compute_loss(model, inputs)
+        return (loss.detach(), None, None)
+            
 
 
 if __name__ == "__main__":
